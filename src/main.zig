@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const allocator = std.heap.wasm_allocator;
 
@@ -37,7 +38,7 @@ const PPR_W2: u32 = 1;
 const PPR_W3: u32 = 2;
 const PPR_W4: u32 = 1;
 
-var last_encoded: ?[]u8 = null;
+var last_encoded: if (build_options.decode_only) void else ?[]u8 = if (build_options.decode_only) {} else null;
 var last_decoded: ?DecodedSprites = null;
 
 const Prob = struct {
@@ -206,7 +207,7 @@ const Decoder = struct {
                 if (self.range < PX_PROB_MAX_VALUE) {
                     self.range = PX_PROB_MAX_VALUE -% (self.low & (PX_PROB_MAX_VALUE - 1));
                 } else break;
-            } else break;
+            }
             const in_byte: u32 = if (self.offset < self.end) blk: {
                 const v = self.data[self.offset];
                 self.offset += 1;
@@ -861,6 +862,8 @@ export fn encodeSprites(
     palette_ptr: [*]const u32,
     palette_count: u32,
 ) [*]allowzero const u8 {
+    if (build_options.decode_only) return @ptrFromInt(0);
+
     if (last_encoded) |buf| {
         allocator.free(buf);
         last_encoded = null;
@@ -887,11 +890,13 @@ export fn encodeSprites(
 }
 
 export fn getEncodedSize() u32 {
+    if (build_options.decode_only) return 0;
     if (last_encoded) |buf| return @intCast(buf.len);
     return 0;
 }
 
 export fn freeEncoded() void {
+    if (build_options.decode_only) return;
     if (last_encoded) |buf| {
         allocator.free(buf);
         last_encoded = null;
