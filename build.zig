@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
+        .single_threaded = true,
     });
     wasm_module.addOptions("build_options", options);
 
@@ -24,6 +25,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    wasm.root_module.strip = true;
 
     b.installArtifact(wasm);
 }

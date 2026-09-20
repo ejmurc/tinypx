@@ -29,14 +29,8 @@ const ModelKind = enum(u8) {
     nw = 1,
     w = 2,
 };
-const ALL_MODELS = [_]ModelKind{ .hash, .nw, .w };
-const NUM_MODELS: usize = ALL_MODELS.len;
 
-const PPR_W0: u32 = 4;
-const PPR_W1: u32 = 2;
-const PPR_W2: u32 = 1;
-const PPR_W3: u32 = 2;
-const PPR_W4: u32 = 1;
+const MIXED_SCALE: u64 = PX_PROB_MAX_VALUE;
 
 var last_encoded: if (build_options.decode_only) void else ?[]u8 = if (build_options.decode_only) {} else null;
 var last_decoded: ?DecodedSprites = null;
@@ -220,24 +214,6 @@ const Decoder = struct {
     }
 };
 
-fn arithGetProb(ctx: *const Context, symbol: usize) Prob {
-    var low: u32 = 0;
-    for (0..symbol) |i| low += ctx.freq[i];
-    return .{ .low = low, .high = low + ctx.freq[symbol], .scale = ctx.sum };
-}
-
-fn getSymFromFreq(ctx: *const Context, target_freq: u32) struct { prob: Prob, symbol: usize } {
-    var s: usize = 0;
-    var cum: u32 = 0;
-    while (s <= PX_FREQ_END) : (s += 1) {
-        cum += ctx.freq[s];
-        if (cum > target_freq) break;
-    }
-    if (s > PX_FREQ_END) s = PX_FREQ_END;
-    const low = cum - ctx.freq[s];
-    return .{ .prob = .{ .low = low, .high = cum, .scale = ctx.sum }, .symbol = s };
-}
-
 fn contextUpdate(ctx: *Context, symbol: usize, freq_max: *u32, palette_size: usize) void {
     ctx.freq[symbol] += 2;
     ctx.sum += 2;
@@ -250,98 +226,6 @@ fn contextUpdate(ctx: *Context, symbol: usize, freq_max: *u32, palette_size: usi
             const scaled: u16 = (val + 1) >> 1;
             ctx.freq[i] = scaled;
             ctx.sum += scaled;
-        }
-    }
-}
-
-fn encodeModel(alloc: Allocator, idx: []const u8, w: usize, h: usize, palette_size: usize, model_kind: ModelKind, out: []u8) !usize {
-    var m = try Model.init(alloc, model_kind, palette_size);
-    defer m.deinit(alloc);
-    const escape = m.index_escape;
-    var ac = Encoder.init(out);
-    var freq_max: u32 = PX_FREQ_MAX;
-    var pos: usize = 0;
-    for (0..h) |y| {
-        for (0..w) |x| {
-            const sym = idx[pos];
-            const ctx = m.buildContext(idx, pos, x, y, w);
-            var encoded = false;
-            if (ctx.sum != 0) {
-                if (ctx.freq[sym] != 0) {
-                    const prob = arithGetProb(ctx, sym);
-                    ac.encode(prob);
-                    ac.normalize();
-                    contextUpdate(ctx, sym, &freq_max, palette_size);
-                    encoded = true;
-                } else {
-                    const prob = arithGetProb(ctx, escape);
-                    ac.encode(prob);
-                    ac.normalize();
-                    ctx.freq[escape] += 1;
-                    ctx.sum += 1;
-                }
-            }
-            if (!encoded) {
-                const order0 = &m.contexts[0];
-                const prob = arithGetProb(order0, sym);
-                ac.encode(prob);
-                ac.normalize();
-                contextUpdate(order0, sym, &freq_max, palette_size);
-                if (ctx.sum == 0) {
-                    ctx.freq[escape] = 1;
-                    ctx.sum = 1;
-                }
-                ctx.freq[sym] = 1;
-                ctx.sum += 1;
-            }
-            pos += 1;
-        }
-    }
-    ac.flush();
-    return ac.offset;
-}
-
-fn decodeModel(alloc: Allocator, in_bytes: []const u8, in_size: usize, w: usize, h: usize, palette_size: usize, model_kind: ModelKind, idx: []u8) !void {
-    var m = try Model.init(alloc, model_kind, palette_size);
-    defer m.deinit(alloc);
-    const escape = m.index_escape;
-    var ac = Decoder.init(in_bytes, in_size);
-    var freq_max: u32 = PX_FREQ_MAX;
-    var pos: usize = 0;
-    for (0..h) |y| {
-        for (0..w) |x| {
-            const ctx = m.buildContext(idx, pos, x, y, w);
-            var sym: u8 = 0;
-            var decoded = false;
-            if (ctx.sum != 0) {
-                const f = ac.currFreq(ctx.sum);
-                const r = getSymFromFreq(ctx, f);
-                ac.update(r.prob);
-                if (r.symbol != escape) {
-                    sym = @intCast(r.symbol);
-                    contextUpdate(ctx, r.symbol, &freq_max, palette_size);
-                    decoded = true;
-                } else {
-                    ctx.freq[escape] += 1;
-                    ctx.sum += 1;
-                }
-            }
-            if (!decoded) {
-                const order0 = &m.contexts[0];
-                const f = ac.currFreq(order0.sum);
-                const r = getSymFromFreq(order0, f);
-                ac.update(r.prob);
-                sym = @intCast(r.symbol);
-                contextUpdate(order0, r.symbol, &freq_max, palette_size);
-                if (ctx.sum == 0) {
-                    ctx.freq[escape] = 1;
-                    ctx.sum = 1;
-                }
-                ctx.freq[sym] = 1;
-                ctx.sum += 1;
-            }
-            idx[pos] = sym;
-            pos += 1;
         }
     }
 }
@@ -468,6 +352,12 @@ fn ppRank(
     return .{ .sorted = sorted, .pr = pr, .pg = pg, .pb = pb };
 }
 
+const PPR_W0: u32 = 4;
+const PPR_W1: u32 = 2;
+const PPR_W2: u32 = 1;
+const PPR_W3: u32 = 2;
+const PPR_W4: u32 = 1;
+
 fn applyPPR(alloc: Allocator, palette: []const u32, orig_idx: []const u8, width: usize, height: usize) ![]u8 {
     const n = palette.len;
     var tables = try PPRTables.init(alloc, n);
@@ -558,6 +448,152 @@ fn reversePPR(alloc: Allocator, palette: []const u32, new_idx: []const u8, width
     return orig_idx;
 }
 
+const MixedModels = struct {
+    hash: Model,
+    nw: Model,
+    w: Model,
+
+    fn init(alloc: Allocator, palette_size: usize) !MixedModels {
+        return .{
+            .hash = try Model.init(alloc, .hash, palette_size),
+            .nw = try Model.init(alloc, .nw, palette_size),
+            .w = try Model.init(alloc, .w, palette_size),
+        };
+    }
+
+    fn deinit(self: *MixedModels, alloc: Allocator) void {
+        self.hash.deinit(alloc);
+        self.nw.deinit(alloc);
+        self.w.deinit(alloc);
+    }
+
+    fn order0(self: *MixedModels) *Context {
+        return &self.hash.contexts[0];
+    }
+};
+
+fn buildMixedFreq(
+    order0: *const Context,
+    hash_ctx: *const Context,
+    nw_ctx: *const Context,
+    w_ctx: *const Context,
+    palette_size: usize,
+    out_freq: *[256]u32,
+) u32 {
+    const w_hash: u64 = hash_ctx.sum;
+    const w_nw: u64 = nw_ctx.sum;
+    const w_w: u64 = w_ctx.sum;
+    const total_weight: u64 = 1 + w_hash + w_nw + w_w;
+
+    var combined_sum: u32 = 0;
+    for (0..palette_size) |s| {
+        var contrib: u64 = @as(u64, order0.freq[s]) * MIXED_SCALE / order0.sum;
+        if (w_hash > 0) contrib += w_hash * @as(u64, hash_ctx.freq[s]) * MIXED_SCALE / hash_ctx.sum;
+        if (w_nw > 0) contrib += w_nw * @as(u64, nw_ctx.freq[s]) * MIXED_SCALE / nw_ctx.sum;
+        if (w_w > 0) contrib += w_w * @as(u64, w_ctx.freq[s]) * MIXED_SCALE / w_ctx.sum;
+
+        var val: u32 = @intCast(contrib / total_weight);
+        if (val == 0) val = 1;
+        out_freq[s] = val;
+        combined_sum += val;
+    }
+    return combined_sum;
+}
+
+fn mixedGetProb(freq: *const [256]u32, sum: u32, symbol: usize) Prob {
+    var low: u32 = 0;
+    for (0..symbol) |i| low += freq[i];
+    return .{ .low = low, .high = low + freq[symbol], .scale = sum };
+}
+
+fn mixedGetSymFromFreq(freq: *const [256]u32, sum: u32, palette_size: usize, target_freq: u32) struct { prob: Prob, symbol: usize } {
+    var s: usize = 0;
+    var cum: u32 = 0;
+    while (s < palette_size) : (s += 1) {
+        cum += freq[s];
+        if (cum > target_freq) break;
+    }
+    if (s >= palette_size) s = palette_size - 1;
+    const low = cum - freq[s];
+    return .{ .prob = .{ .low = low, .high = cum, .scale = sum }, .symbol = s };
+}
+
+fn encodeMixed(alloc: Allocator, idx: []const u8, w: usize, h: usize, palette_size: usize, out: []u8) !usize {
+    var m = try MixedModels.init(alloc, palette_size);
+    defer m.deinit(alloc);
+    const order0 = m.order0();
+
+    var ac = Encoder.init(out);
+    var freq_max_order0: u32 = PX_FREQ_MAX;
+    var freq_max_hash: u32 = PX_FREQ_MAX;
+    var freq_max_nw: u32 = PX_FREQ_MAX;
+    var freq_max_w: u32 = PX_FREQ_MAX;
+
+    var scratch: [256]u32 = undefined;
+    var pos: usize = 0;
+
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const sym = idx[pos];
+            const hash_ctx = m.hash.buildContext(idx, pos, x, y, w);
+            const nw_ctx = m.nw.buildContext(idx, pos, x, y, w);
+            const w_ctx = m.w.buildContext(idx, pos, x, y, w);
+
+            const sum = buildMixedFreq(order0, hash_ctx, nw_ctx, w_ctx, palette_size, &scratch);
+            const prob = mixedGetProb(&scratch, sum, sym);
+            ac.encode(prob);
+            ac.normalize();
+
+            contextUpdate(order0, sym, &freq_max_order0, palette_size);
+            contextUpdate(hash_ctx, sym, &freq_max_hash, palette_size);
+            contextUpdate(nw_ctx, sym, &freq_max_nw, palette_size);
+            contextUpdate(w_ctx, sym, &freq_max_w, palette_size);
+
+            pos += 1;
+        }
+    }
+
+    ac.flush();
+    return ac.offset;
+}
+
+fn decodeMixed(alloc: Allocator, in_bytes: []const u8, in_size: usize, w: usize, h: usize, palette_size: usize, idx: []u8) !void {
+    var m = try MixedModels.init(alloc, palette_size);
+    defer m.deinit(alloc);
+    const order0 = m.order0();
+
+    var ac = Decoder.init(in_bytes, in_size);
+    var freq_max_order0: u32 = PX_FREQ_MAX;
+    var freq_max_hash: u32 = PX_FREQ_MAX;
+    var freq_max_nw: u32 = PX_FREQ_MAX;
+    var freq_max_w: u32 = PX_FREQ_MAX;
+
+    var scratch: [256]u32 = undefined;
+    var pos: usize = 0;
+
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const hash_ctx = m.hash.buildContext(idx, pos, x, y, w);
+            const nw_ctx = m.nw.buildContext(idx, pos, x, y, w);
+            const w_ctx = m.w.buildContext(idx, pos, x, y, w);
+
+            const sum = buildMixedFreq(order0, hash_ctx, nw_ctx, w_ctx, palette_size, &scratch);
+            const f = ac.currFreq(sum);
+            const r = mixedGetSymFromFreq(&scratch, sum, palette_size, f);
+            ac.update(r.prob);
+
+            const sym: u8 = @intCast(r.symbol);
+            contextUpdate(order0, r.symbol, &freq_max_order0, palette_size);
+            contextUpdate(hash_ctx, r.symbol, &freq_max_hash, palette_size);
+            contextUpdate(nw_ctx, r.symbol, &freq_max_nw, palette_size);
+            contextUpdate(w_ctx, r.symbol, &freq_max_w, palette_size);
+
+            idx[pos] = sym;
+            pos += 1;
+        }
+    }
+}
+
 const CompressedIndexMap = struct {
     bytes: []u8,
     bytes_size: usize,
@@ -565,22 +601,10 @@ const CompressedIndexMap = struct {
 };
 
 fn compressIndexMap(alloc: Allocator, idx: []const u8, w: usize, h: usize, palette_size: usize, tmp: []u8) !CompressedIndexMap {
-    var best_size: usize = 0;
-    var best_model: ModelKind = .hash;
-    var best = try alloc.alloc(u8, tmp.len);
-    for (ALL_MODELS) |model| {
-        const size = try encodeModel(alloc, idx, w, h, palette_size, model, tmp);
-        if (size == 0) continue;
-        if (best_size == 0 or size < best_size) {
-            best_size = size;
-            best_model = model;
-            @memcpy(best[0..size], tmp[0..size]);
-        }
-    }
-    const result = try alloc.alloc(u8, best_size);
-    @memcpy(result, best[0..best_size]);
-    alloc.free(best);
-    return .{ .bytes = result, .bytes_size = best_size, .model = best_model };
+    const size = try encodeMixed(alloc, idx, w, h, palette_size, tmp);
+    const result = try alloc.alloc(u8, size);
+    @memcpy(result, tmp[0..size]);
+    return .{ .bytes = result, .bytes_size = size, .model = .hash };
 }
 
 fn varintSize(v_in: usize) usize {
@@ -621,7 +645,21 @@ pub fn buildSharedPalette(alloc: Allocator, sprites: []const []const u32) !Share
     defer map.deinit();
     var palette = std.ArrayList(u32){};
     defer palette.deinit(alloc);
-    try palette.append(alloc, 0x00000000);
+
+    var has_transparency = false;
+    for (sprites) |pixels| {
+        for (pixels) |c| {
+            if ((c >> 24) == 0) {
+                has_transparency = true;
+                break;
+            }
+        }
+        if (has_transparency) break;
+    }
+
+    if (has_transparency) {
+        try palette.append(alloc, 0x00000000);
+    }
 
     var idx_arrays = try alloc.alloc([]u8, sprites.len);
     for (sprites, 0..) |pixels, si| {
@@ -795,9 +833,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !DecodedSprites {
     for (0..sprite_count) |s| {
         const flags = bytes[off];
         off += 1;
-        const model_byte = bytes[off];
-        off += 1;
-        const model: ModelKind = @enumFromInt(model_byte);
+        off += 1; // model byte, unused by the mixed decoder
         const is_small = (flags & 1) != 0;
         const use_ppr = (flags & 2) != 0;
 
@@ -832,7 +868,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !DecodedSprites {
         const decoded_idx = try alloc.alloc(u8, w * h);
         defer alloc.free(decoded_idx);
         @memset(decoded_idx, 0);
-        try decodeModel(alloc, img_bytes, bytes_size, w, h, palette.len, model, decoded_idx);
+        try decodeMixed(alloc, img_bytes, bytes_size, w, h, palette.len, decoded_idx);
 
         const data = if (use_ppr)
             try reversePPR(alloc, palette, decoded_idx, w, h)
